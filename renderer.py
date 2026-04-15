@@ -28,6 +28,9 @@ from reportlab.platypus import (
 )
 from reportlab.platypus.flowables import HRFlowable
 
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+
 from config import (
     COL_GAP,
     COL_WIDTH,
@@ -41,10 +44,24 @@ from config import (
     NUM_COLS,
     PAGE_HEIGHT,
     PAGE_WIDTH,
+    PALATINO_PATHS,
 )
 from models import Article
 
 logger = logging.getLogger(__name__)
+
+# Register Palatino Linotype font family
+pdfmetrics.registerFont(TTFont("Palatino", PALATINO_PATHS["regular"]))
+pdfmetrics.registerFont(TTFont("Palatino-Bold", PALATINO_PATHS["bold"]))
+pdfmetrics.registerFont(TTFont("Palatino-Italic", PALATINO_PATHS["italic"]))
+pdfmetrics.registerFont(TTFont("Palatino-BoldItalic", PALATINO_PATHS["bold_italic"]))
+pdfmetrics.registerFontFamily(
+    "Palatino",
+    normal="Palatino",
+    bold="Palatino-Bold",
+    italic="Palatino-Italic",
+    boldItalic="Palatino-BoldItalic",
+)
 
 DARK_GRAY = Color(0.3, 0.3, 0.3)
 RULE_COLOR = Color(0.6, 0.6, 0.6)
@@ -326,7 +343,7 @@ def _inline_markdown(text: str) -> str:
     # Italic: *text* or _text_ (but not inside bold)
     text = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"<i>\1</i>", text)
     # Inline code: `text`
-    text = re.sub(r"`([^`]+)`", r'<font face="Courier" size="6">\1</font>', text)
+    text = re.sub(r"`([^`]+)`", r'<font face="Courier" size="7">\1</font>', text)
     return text
 
 
@@ -364,7 +381,7 @@ def _body_to_flowables(
                             _escape_xml(cl) for cl in code_lines
                         )
                         flowables.append(Paragraph(
-                            f'<font face="Courier" size="5.5">{code_text}</font>',
+                            f'<font face="Courier" size="6.5">{code_text}</font>',
                             styles["body"],
                         ))
                         flowables.append(Spacer(1, 2))
@@ -426,7 +443,7 @@ def _body_to_flowables(
     if code_lines:
         code_text = "<br/>".join(_escape_xml(cl) for cl in code_lines)
         flowables.append(Paragraph(
-            f'<font face="Courier" size="5.5">{code_text}</font>',
+            f'<font face="Courier" size="6.5">{code_text}</font>',
             styles["body"],
         ))
 
@@ -677,7 +694,7 @@ def render(
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    font_offset = font_size - 7.0
+    font_offset = font_size - 8.5
     styles = _build_styles(font_offset)
 
     # Page count targeting

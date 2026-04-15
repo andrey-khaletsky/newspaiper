@@ -24,7 +24,7 @@ from pathlib import Path
 
 from cleaner import clean
 from config import DEFAULT_CATEGORIES, DEFAULT_FONT_SIZE, DEFAULT_PAGES
-from harvester import harvest
+from harvester import harvest, fetch_all_sources
 from models import Article
 from renderer import render
 
@@ -200,10 +200,26 @@ def main():
 
     # Stage 1 — Harvest
     logger.info("--- Stage 1: Harvesting articles ---")
-    articles = harvest(target_date, categories)
-    if not articles:
-        logger.error("No articles found for %s. Is it a weekend or future date?", target_date)
-        sys.exit(1)
+
+    if args.select:
+        from selector import visual_select
+
+        # Open browser — user browses tldr.tech and picks articles
+        articles = visual_select()
+        if not articles:
+            logger.error("No articles selected. Exiting.")
+            sys.exit(1)
+        logger.info("Selected %d articles", len(articles))
+
+        # Fetch source text for selected articles only
+        logger.info("Fetching full text for %d selected articles...", len(articles))
+        fetch_all_sources(articles)
+    else:
+        articles = harvest(target_date, categories)
+        if not articles:
+            logger.error("No articles found for %s. Is it a weekend or future date?", target_date)
+            sys.exit(1)
+
     logger.info("Harvested %d articles", len(articles))
 
     # Stage 2 — Clean & Validate
@@ -214,21 +230,6 @@ def main():
     if not articles:
         logger.error("No articles survived cleaning. Cannot generate PDF.")
         sys.exit(1)
-
-    # Interactive selection
-    if args.select:
-        sel_path = Path(f"output/selection_{target_date.isoformat()}.txt")
-        sel_path.parent.mkdir(parents=True, exist_ok=True)
-        _write_selection_file(articles, target_date, sel_path)
-        logger.info("Selection file: %s", sel_path)
-        _open_in_editor(sel_path)
-
-        articles = _parse_selection_file(sel_path, articles)
-        logger.info("Selected %d articles", len(articles))
-
-        if not articles:
-            logger.error("No articles selected. Exiting.")
-            sys.exit(1)
 
     # Stage 3 — Layout & Render
     logger.info("--- Stage 3: Rendering PDF ---")
