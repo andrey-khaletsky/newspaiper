@@ -131,33 +131,42 @@ def parse_tldr_page(html: str, category: str) -> list[Article]:
 # ---------------------------------------------------------------------------
 
 def fetch_tldr_pages(
-    target_date: date,
+    target_date: date | None = None,
     categories: list[str] | None = None,
 ) -> list[Article]:
-    """Fetch and parse TLDR newsletter pages for the given categories."""
+    """Fetch and parse TLDR newsletter pages for the given categories.
+
+    If target_date is None, fetches the latest issue for each category
+    via the /api/latest/{category} redirect.
+    """
     if categories is None:
         categories = DEFAULT_CATEGORIES
 
     all_articles: list[Article] = []
 
     for cat in categories:
-        url = f"{TLDR_BASE_URL}/{cat}/{target_date.isoformat()}"
-        logger.info("Fetching TLDR %s for %s: %s", cat, target_date, url)
+        if target_date is None:
+            url = f"{TLDR_BASE_URL}/api/latest/{cat}"
+            logger.info("Fetching latest TLDR %s: %s", cat, url)
+        else:
+            url = f"{TLDR_BASE_URL}/{cat}/{target_date.isoformat()}"
+            logger.info("Fetching TLDR %s for %s: %s", cat, target_date, url)
 
         try:
             resp = requests.get(url, headers=HEADERS, timeout=FETCH_TIMEOUT,
                                 allow_redirects=True)
             # TLDR redirects to homepage for missing dates
-            if resp.url.rstrip("/") in (TLDR_BASE_URL, f"{TLDR_BASE_URL}/"):
-                logger.warning("No %s newsletter for %s (redirect to homepage)", cat, target_date)
+            final = resp.url.rstrip("/")
+            if final in (TLDR_BASE_URL, f"{TLDR_BASE_URL}/"):
+                logger.warning("No %s newsletter found (redirect to homepage)", cat)
                 continue
-            if resp.url.rstrip("/") == f"{TLDR_BASE_URL}/{cat}":
-                logger.warning("No %s newsletter for %s (redirect to category page)", cat, target_date)
+            if final == f"{TLDR_BASE_URL}/{cat}":
+                logger.warning("No %s newsletter found (redirect to category page)", cat)
                 continue
 
             resp.raise_for_status()
             page_articles = parse_tldr_page(resp.text, cat)
-            logger.info("  Found %d articles in %s", len(page_articles), cat)
+            logger.info("  Found %d articles in %s (%s)", len(page_articles), cat, resp.url)
             all_articles.extend(page_articles)
 
         except requests.RequestException as e:
@@ -248,9 +257,22 @@ def _fetch_google_cache(url: str) -> str | None:
 def fetch_source_article(article: Article) -> Article:
     """Fetch full text from the article's source URL with fallback chain.
 
-    Chain: trafilatura (precision) → trafilatura (recall) →
+    Chain: cache → trafilatura (precision) → trafilatura (recall) →
            readability-lxml → Wayback Machine → Google Cache
     """
+    from cache import get_article, put_article
+
+    # Check cache first
+    cached = get_article(article.source_url)
+    if cached and cached.body:
+        article.body = cached.body
+        article.word_count = cached.word_count
+        article.fetch_status = cached.fetch_status
+        article.image_url = cached.image_url or article.image_url
+        article.is_paywalled = cached.is_paywalled
+        logger.info("    (cached)")
+        return article
+
     html = None
 
     # Step 0: Download the page
@@ -342,11 +364,25 @@ def fetch_source_article(article: Article) -> Article:
 
 def fetch_all_sources(articles: list[Article]) -> list[Article]:
     """Fetch full text for all articles, respecting rate limits."""
+    from cache import get_article, put_article
+
     total = len(articles)
+    cached_count = 0
     for i, article in enumerate(articles, 1):
+        was_cached = bool(get_article(article.source_url) and get_article(article.source_url).body)
         logger.info("  [%d/%d] Fetching %s", i, total, article.source_domain)
         fetch_source_article(article)
-        time.sleep(FETCH_DELAY)
+
+        # Save to cache (even failed ones, to avoid re-trying)
+        put_article(article)
+
+        if was_cached:
+            cached_count += 1
+        else:
+            time.sleep(FETCH_DELAY)
+
+    if cached_count:
+        logger.info("  %d/%d articles loaded from cache", cached_count, total)
     return articles
 
 
@@ -355,10 +391,13 @@ def fetch_all_sources(articles: list[Article]) -> list[Article]:
 # ---------------------------------------------------------------------------
 
 def harvest(
-    target_date: date,
+    target_date: date | None = None,
     categories: list[str] | None = None,
 ) -> list[Article]:
-    """Full Stage 1: fetch TLDR pages, then fetch source articles."""
+    """Full Stage 1: fetch TLDR pages, then fetch source articles.
+
+    If target_date is None, fetches the latest issue for each category.
+    """
     articles = fetch_tldr_pages(target_date, categories)
     if not articles:
         return []

@@ -24,7 +24,7 @@ from pathlib import Path
 
 from cleaner import clean
 from config import DEFAULT_CATEGORIES, DEFAULT_FONT_SIZE, DEFAULT_PAGES
-from harvester import harvest, fetch_all_sources
+from harvester import harvest
 from models import Article
 from renderer import render
 
@@ -189,38 +189,33 @@ def main():
 
     args = parser.parse_args()
 
-    target_date = args.date or date.today()
+    target_date = args.date  # None means "latest"
     categories = args.categories.split(",") if args.categories else None
-    output_path = args.output or f"output/newspaiper_{target_date.isoformat()}.pdf"
+    date_label = target_date.isoformat() if target_date else date.today().isoformat()
+    output_path = args.output or f"output/newspaiper_{date_label}.pdf"
 
     logger.info("=== NEWSPAIPER ===")
-    logger.info("Date: %s", target_date)
+    logger.info("Date: %s", target_date or "latest")
     logger.info("Categories: %s", categories or DEFAULT_CATEGORIES)
     logger.info("Target pages: %s, booklet: %s", args.pages or "auto", args.booklet)
 
     # Stage 1 — Harvest
     logger.info("--- Stage 1: Harvesting articles ---")
+    articles = harvest(target_date, categories)
+    if not articles:
+        logger.error("No articles found. Is it a weekend or future date?")
+        sys.exit(1)
+    logger.info("Harvested %d articles", len(articles))
 
     if args.select:
         from selector import visual_select
 
-        # Open browser — user browses tldr.tech and picks articles
-        articles = visual_select()
+        # Show selection UI — user picks which articles to include
+        articles = visual_select(articles)
         if not articles:
             logger.error("No articles selected. Exiting.")
             sys.exit(1)
         logger.info("Selected %d articles", len(articles))
-
-        # Fetch source text for selected articles only
-        logger.info("Fetching full text for %d selected articles...", len(articles))
-        fetch_all_sources(articles)
-    else:
-        articles = harvest(target_date, categories)
-        if not articles:
-            logger.error("No articles found for %s. Is it a weekend or future date?", target_date)
-            sys.exit(1)
-
-    logger.info("Harvested %d articles", len(articles))
 
     # Stage 2 — Clean & Validate
     logger.info("--- Stage 2: Cleaning & validating ---")
@@ -235,7 +230,7 @@ def main():
     logger.info("--- Stage 3: Rendering PDF ---")
     pdf_path = render(
         articles,
-        target_date=target_date.isoformat(),
+        target_date=date_label,
         output_path=output_path,
         target_pages=args.pages,
         booklet=args.booklet,

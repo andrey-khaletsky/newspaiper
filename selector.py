@@ -1,326 +1,291 @@
-"""Visual article selection via TLDR.tech proxy.
+"""Visual article selection via a local HTML page.
 
-Transparently proxies tldr.tech through a local server, injecting a selection
-overlay on every HTML page. The user browses the real site, clicks articles
-to select them, and hits Done. Selected article data is extracted from the
-DOM and returned as Article objects.
+Scrapes articles from TLDR, generates a self-contained selection page,
+serves it locally. User clicks to pick articles, hits Done. No proxy needed.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import re
 import threading
 import webbrowser
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from typing import Any
 from urllib.parse import urlparse
-
-import requests
 
 from models import Article
 
 logger = logging.getLogger(__name__)
 
 SERVER_TIMEOUT = 600  # 10 minutes
-TLDR_BASE = "https://tldr.tech"
 
-# ---------------------------------------------------------------------------
-# Injected CSS + JS (appended before </body> on every HTML page)
-# ---------------------------------------------------------------------------
 
-INJECTION = r"""
-<!-- NEWSPAIPER SELECTOR -->
-<style id="np-sel-css">
-#np-toolbar {
-    position: fixed; top: 0; left: 0; right: 0; z-index: 999999;
-    background: #1a1a2e; color: #eee;
-    padding: 10px 20px; display: flex; align-items: center; gap: 12px;
-    font-family: -apple-system, Helvetica, Arial, sans-serif; font-size: 14px;
-    box-shadow: 0 2px 12px rgba(0,0,0,0.4);
-}
-#np-toolbar .np-title { font-weight: bold; font-size: 16px; letter-spacing: 0.5px; }
-#np-toolbar .np-spacer { flex: 1; }
-#np-toolbar .np-counter {
-    background: #333; padding: 5px 12px; border-radius: 4px;
+def _escape_html(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def _build_selection_html(articles: list[Article]) -> str:
+    """Build a self-contained HTML selection page from article data."""
+
+    # Build article cards HTML — flat list, JS handles grouping/sorting
+    cards_html = ""
+    for i, a in enumerate(articles):
+        domain = _escape_html(a.source_domain)
+        title = _escape_html(a.title)
+        summary = _escape_html(a.tldr_summary[:200]) if a.tldr_summary else ""
+        read_time = _escape_html(a.read_time) if a.read_time else ""
+        cat = _escape_html(a.category)
+        words = a.word_count
+        img_url = _escape_html(a.image_url) if a.image_url and a.image_url.startswith("http") else ""
+
+        thumb_html = f'<img class="article-thumb" src="{img_url}" loading="lazy" onerror="this.style.display=\'none\'">' if img_url else ""
+        words_label = f"{words} words" if words else "summary"
+
+        source_url = _escape_html(a.source_url)
+
+        cards_html += f'''<div class="article" data-idx="{i}" data-state="full" data-words="{words}" data-cat="{cat}" data-cat-order="{i}">
+  <div class="article-marker"></div>
+  <div class="article-body">
+    <div class="article-meta">{domain}{(' · ' + read_time) if read_time else ''} · {words_label}</div>
+    <div class="article-title">{title}</div>
+    <div class="article-summary">{summary}</div>
+  </div>
+  {thumb_html}
+  <a class="article-link" href="{source_url}" target="_blank" title="Open source article">&#8599;</a>
+</div>\n'''
+
+    return f"""<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<title>NEWSPAIPER — Select Articles</title>
+<style>
+* {{ margin: 0; padding: 0; box-sizing: border-box; }}
+body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+       background: #0f0f0f; color: #e0e0e0; padding-bottom: 80px; }}
+
+#toolbar {{
+    position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+    background: #1a1a2e; padding: 12px 24px; display: flex; align-items: center; gap: 14px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.5); font-size: 14px;
+}}
+#np-title {{ font-weight: 700; font-size: 17px; letter-spacing: 0.5px; }}
+#toolbar .spacer {{ flex: 1; }}
+.counter {{
+    background: #2a2a3e; padding: 5px 14px; border-radius: 4px;
     font-size: 13px; font-variant-numeric: tabular-nums;
-}
-#np-toolbar .np-counter.full { border-left: 3px solid #22c55e; }
-#np-toolbar .np-counter.summary { border-left: 3px solid #f59e0b; }
-#np-toolbar .np-counter.excluded { border-left: 3px solid #666; }
-#np-toolbar button {
-    padding: 7px 18px; border: none; border-radius: 4px;
+}}
+.counter.full {{ border-left: 3px solid #22c55e; }}
+.counter.summary {{ border-left: 3px solid #f59e0b; }}
+.counter.excluded {{ border-left: 3px solid #555; }}
+#toolbar button {{
+    padding: 8px 20px; border: none; border-radius: 5px;
     cursor: pointer; font-size: 13px; font-weight: 600;
-}
-#np-done { background: #22c55e; color: #000; }
-#np-done:hover { background: #16a34a; }
-#np-select-all, #np-clear-all { background: #444; color: #eee; }
-#np-select-all:hover, #np-clear-all:hover { background: #555; }
+}}
+#btn-done {{ background: #22c55e; color: #000; }}
+#btn-done:hover {{ background: #16a34a; }}
+#btn-all, #btn-summary-all, #btn-clear {{ background: #3a3a4e; color: #ddd; }}
+#btn-all:hover, #btn-summary-all:hover, #btn-clear:hover {{ background: #4a4a5e; }}
+#btn-summary-all {{ border-left: 3px solid #f59e0b; }}
+#btn-sort {{ background: #2a2a3e; color: #aaa; border: 1px solid #444; }}
+#btn-sort:hover {{ background: #3a3a4e; color: #ddd; }}
 
-body { padding-top: 52px !important; }
+.container {{ max-width: 700px; margin: 0 auto; padding: 70px 16px 20px; }}
 
-article.mt-3 {
-    cursor: pointer !important;
-    transition: opacity 0.15s ease, border-color 0.15s ease;
-    border-left: 5px solid transparent !important;
-    padding-left: 10px !important;
-    margin-left: -15px !important;
-}
-article.mt-3[data-np-state="excluded"] { opacity: 0.25 !important; }
-article.mt-3[data-np-state="excluded"] h3 { text-decoration: line-through !important; }
-article.mt-3[data-np-state="full"] { border-left-color: #22c55e !important; opacity: 1 !important; }
-article.mt-3[data-np-state="summary"] { border-left-color: #f59e0b !important; opacity: 0.65 !important; }
-article.mt-3[data-np-sponsor="true"] { opacity: 0.10 !important; pointer-events: none !important; }
+.cat-header {{
+    font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 1.5px;
+    color: #888; margin: 24px 0 8px; padding: 6px 0; border-bottom: 1px solid #2a2a2a;
+}}
+
+.article {{
+    display: flex; gap: 12px; padding: 12px 14px; margin: 4px 0;
+    border-radius: 6px; cursor: pointer; transition: all 0.12s;
+    border-left: 4px solid transparent;
+}}
+.article:hover {{ background: #1a1a2a; }}
+.article[data-state="full"] {{ border-left-color: #22c55e; opacity: 1; }}
+.article[data-state="summary"] {{ border-left-color: #f59e0b; opacity: 0.7; }}
+.article[data-state="excluded"] {{ border-left-color: transparent; opacity: 0.3; }}
+.article[data-state="excluded"] .article-title {{ text-decoration: line-through; }}
+
+.article-marker {{
+    width: 18px; height: 18px; border-radius: 50%; margin-top: 2px; flex-shrink: 0;
+    border: 2px solid #555; transition: all 0.12s;
+}}
+.article[data-state="full"] .article-marker {{ background: #22c55e; border-color: #22c55e; }}
+.article[data-state="summary"] .article-marker {{ background: #f59e0b; border-color: #f59e0b; }}
+
+.article-link {{
+    flex-shrink: 0; align-self: center; text-decoration: none;
+    font-size: 18px; color: #555; padding: 4px 8px; border-radius: 4px;
+    transition: color 0.12s, background 0.12s;
+}}
+.article-link:hover {{ color: #ddd; background: #2a2a3e; }}
+.article-thumb {{
+    width: 100px; height: 64px; border-radius: 4px; object-fit: cover; flex-shrink: 0;
+    background: #1a1a2a; align-self: center;
+}}
+.article-body {{ flex: 1; min-width: 0; }}
+.article-meta {{ font-size: 11px; color: #666; margin-bottom: 3px; }}
+.article-title {{ font-size: 14px; font-weight: 600; line-height: 1.3; }}
+.article-summary {{ font-size: 12px; color: #777; margin-top: 4px; line-height: 1.4;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }}
+
+.legend {{
+    text-align: center; padding: 16px; font-size: 12px; color: #555; margin-top: 8px;
+}}
+.legend span {{ margin: 0 10px; }}
+.legend .dot {{ display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+    vertical-align: middle; margin-right: 4px; }}
+.dot-full {{ background: #22c55e; }}
+.dot-summary {{ background: #f59e0b; }}
+.dot-excluded {{ background: #555; }}
 </style>
+</head><body>
 
-<div id="np-toolbar">
-    <span class="np-title">NEWSPAIPER</span>
-    <span class="np-spacer"></span>
-    <span class="np-counter full" id="np-count-full">0 full</span>
-    <span class="np-counter summary" id="np-count-summary">0 summary</span>
-    <span class="np-counter excluded" id="np-count-excluded">0 excl</span>
-    <button id="np-select-all">Select All</button>
-    <button id="np-clear-all">Clear All</button>
-    <button id="np-done">Done &#10003;</button>
+<div id="toolbar">
+    <span id="np-title">NEWSPAIPER</span>
+    <span class="spacer"></span>
+    <span class="counter full" id="c-full">0 full</span>
+    <span class="counter summary" id="c-summary">0 summary</span>
+    <span class="counter excluded" id="c-excluded">0 excluded</span>
+    <button id="btn-sort">Sort: by topic</button>
+    <button id="btn-all">All Full</button>
+    <button id="btn-summary-all">All Summary</button>
+    <button id="btn-clear">Clear All</button>
+    <button id="btn-done">Done &#10003;</button>
 </div>
 
-<script id="np-sel-js">
-(function() {
-    // Prevent re-init if already injected (e.g. SPA navigation)
-    if (window.__np_init) return;
-    window.__np_init = true;
+<div class="container">
+<div id="article-list">
+{cards_html}
+</div>
+<div class="legend">
+    <span><span class="dot dot-full"></span> Click once = full text</span>
+    <span><span class="dot dot-summary"></span> Click twice = summary only</span>
+    <span><span class="dot dot-excluded"></span> Click three = excluded</span>
+</div>
+</div>
 
-    const STORAGE_KEY = 'np_selection';
-    // selection: { "url": { mode: "full"|"summary", title, readTime, summary, category } }
-    function loadSel() {
-        try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'); } catch(e) { return {}; }
-    }
-    function saveSel(s) { localStorage.setItem(STORAGE_KEY, JSON.stringify(s)); }
+<script>
+const states = ['full', 'summary', 'excluded'];
+const sortModes = ['topic', 'longest', 'shortest'];
+let currentSort = 0;
 
-    const states = ['excluded', 'full', 'summary'];
+const container = document.getElementById('article-list');
 
-    function initArticles() {
-        const sel = loadSel();
+function update() {{
+    let full = 0, summary = 0, excluded = 0;
+    document.querySelectorAll('.article').forEach(el => {{
+        const s = el.dataset.state;
+        if (s === 'full') full++;
+        else if (s === 'summary') summary++;
+        else excluded++;
+    }});
+    document.getElementById('c-full').textContent = full + ' full';
+    document.getElementById('c-summary').textContent = summary + ' summary';
+    document.getElementById('c-excluded').textContent = excluded + ' excluded';
+}}
 
-        document.querySelectorAll('article.mt-3').forEach(el => {
-            // Skip already initialized
-            if (el.dataset.npInit) return;
-            el.dataset.npInit = 'true';
+function reorder() {{
+    const mode = sortModes[currentSort];
+    const articles = [...document.querySelectorAll('.article')];
+    const headers = [...document.querySelectorAll('.cat-header')];
 
-            const link = el.querySelector('a.font-bold');
-            if (!link) return;
-            const h3 = link.querySelector('h3');
-            if (!h3) return;
+    // Remove all from DOM
+    headers.forEach(h => h.remove());
+    articles.forEach(a => a.remove());
 
-            const rawTitle = h3.textContent.trim();
+    if (mode === 'topic') {{
+        // Group by category, original order within each
+        articles.sort((a, b) => parseInt(a.dataset.catOrder) - parseInt(b.dataset.catOrder));
+        let lastCat = '';
+        articles.forEach(el => {{
+            if (el.dataset.cat !== lastCat) {{
+                lastCat = el.dataset.cat;
+                const h = document.createElement('div');
+                h.className = 'cat-header';
+                h.textContent = lastCat;
+                container.appendChild(h);
+            }}
+            container.appendChild(el);
+        }});
+    }} else {{
+        // Sort by word count
+        const dir = mode === 'longest' ? -1 : 1;
+        articles.sort((a, b) => dir * (parseInt(a.dataset.words || 0) - parseInt(b.dataset.words || 0)));
+        articles.forEach(el => container.appendChild(el));
+    }}
 
-            // Skip sponsors
-            if (rawTitle.includes('(Sponsor)') || rawTitle.includes('(sponsor)')) {
-                el.dataset.npSponsor = 'true';
-                return;
-            }
+    document.getElementById('btn-sort').textContent = 'Sort: ' + mode;
+}}
 
-            const url = link.getAttribute('href') || '';
-            if (!url) return;
+// Click to cycle state
+document.querySelectorAll('.article').forEach(el => {{
+    el.addEventListener('click', (e) => {{
+        // Don't cycle state when clicking the source link
+        if (e.target.closest('.article-link')) return;
+        const cur = states.indexOf(el.dataset.state);
+        el.dataset.state = states[(cur + 1) % 3];
+        update();
+    }});
+}});
 
-            // Clean URL (strip tracking params)
-            let cleanUrl = url;
-            try {
-                const u = new URL(url);
-                for (const key of [...u.searchParams.keys()]) {
-                    if (key.startsWith('utm_') || key === 'ref' || key === 'source') {
-                        u.searchParams.delete(key);
-                    }
-                }
-                cleanUrl = u.toString();
-            } catch(e) {}
+document.getElementById('btn-sort').addEventListener('click', () => {{
+    currentSort = (currentSort + 1) % sortModes.length;
+    reorder();
+}});
 
-            el.dataset.npUrl = cleanUrl;
+document.getElementById('btn-all').addEventListener('click', () => {{
+    document.querySelectorAll('.article').forEach(el => el.dataset.state = 'full');
+    update();
+}});
 
-            // Restore state
-            if (sel[cleanUrl]) {
-                el.dataset.npState = sel[cleanUrl].mode;
-            } else {
-                el.dataset.npState = 'excluded';
-            }
+document.getElementById('btn-summary-all').addEventListener('click', () => {{
+    document.querySelectorAll('.article').forEach(el => el.dataset.state = 'summary');
+    update();
+}});
 
-            // Extract metadata
-            const readTimeMatch = rawTitle.match(/\((\d+)\s*min(?:ute)?\s*read\)/);
-            const readTime = readTimeMatch ? readTimeMatch[1] + ' min' : '';
-            const readTimeMin = readTimeMatch ? parseInt(readTimeMatch[1]) : 0;
-            const title = rawTitle.replace(/\s*\(\d+\s*min(?:ute)?\s*read\)/, '').trim();
+document.getElementById('btn-clear').addEventListener('click', () => {{
+    document.querySelectorAll('.article').forEach(el => el.dataset.state = 'excluded');
+    update();
+}});
 
-            const summaryDiv = el.querySelector('div.newsletter-html');
-            const summary = summaryDiv ? summaryDiv.textContent.trim() : '';
+document.getElementById('btn-done').addEventListener('click', async () => {{
+    const result = [];
+    document.querySelectorAll('.article').forEach(el => {{
+        if (el.dataset.state !== 'excluded') {{
+            result.push({{ idx: parseInt(el.dataset.idx), mode: el.dataset.state }});
+        }}
+    }});
+    await fetch('/np-done', {{
+        method: 'POST', body: JSON.stringify(result),
+        headers: {{'Content-Type': 'application/json'}}
+    }});
+    document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;font-size:22px;color:#666;">Selection saved. You can close this tab.</div>';
+}});
 
-            // Find category from nearest section header
-            let category = '';
-            let section = el.closest('section');
-            if (section) {
-                const header = section.querySelector('header h3');
-                if (header) category = header.textContent.trim();
-            }
-
-            // Store metadata on element for extraction on Done
-            el.dataset.npTitle = title;
-            el.dataset.npReadTime = readTime;
-            el.dataset.npReadTimeMin = readTimeMin;
-            el.dataset.npSummary = summary;
-            el.dataset.npCategory = category;
-
-            el.addEventListener('click', function(e) {
-                e.preventDefault();
-                e.stopPropagation();
-                const cur = states.indexOf(this.dataset.npState);
-                this.dataset.npState = states[(cur + 1) % 3];
-
-                const s = loadSel();
-                if (this.dataset.npState === 'excluded') {
-                    delete s[this.dataset.npUrl];
-                } else {
-                    s[this.dataset.npUrl] = {
-                        mode: this.dataset.npState,
-                        url: this.dataset.npUrl,
-                        title: this.dataset.npTitle,
-                        readTime: this.dataset.npReadTime,
-                        readTimeMin: parseInt(this.dataset.npReadTimeMin) || 0,
-                        summary: this.dataset.npSummary,
-                        category: this.dataset.npCategory
-                    };
-                }
-                saveSel(s);
-                updateCounters();
-            });
-        });
-    }
-
-    function updateCounters() {
-        const s = loadSel();
-        let full = 0, summary = 0;
-        for (const v of Object.values(s)) {
-            if (v.mode === 'full') full++;
-            else if (v.mode === 'summary') summary++;
-        }
-        document.getElementById('np-count-full').textContent = full + ' full';
-        document.getElementById('np-count-summary').textContent = summary + ' summary';
-
-        let excl = 0;
-        document.querySelectorAll('article.mt-3[data-np-url]').forEach(el => {
-            if (el.dataset.npState === 'excluded') excl++;
-        });
-        document.getElementById('np-count-excluded').textContent = excl + ' excl';
-    }
-
-    document.getElementById('np-select-all').addEventListener('click', function() {
-        const s = loadSel();
-        document.querySelectorAll('article.mt-3[data-np-url]').forEach(el => {
-            el.dataset.npState = 'full';
-            s[el.dataset.npUrl] = {
-                mode: 'full',
-                url: el.dataset.npUrl,
-                title: el.dataset.npTitle,
-                readTime: el.dataset.npReadTime,
-                readTimeMin: parseInt(el.dataset.npReadTimeMin) || 0,
-                summary: el.dataset.npSummary,
-                category: el.dataset.npCategory
-            };
-        });
-        saveSel(s); updateCounters();
-    });
-
-    document.getElementById('np-clear-all').addEventListener('click', function() {
-        const s = loadSel();
-        document.querySelectorAll('article.mt-3[data-np-url]').forEach(el => {
-            el.dataset.npState = 'excluded';
-            delete s[el.dataset.npUrl];
-        });
-        saveSel(s); updateCounters();
-    });
-
-    document.getElementById('np-done').addEventListener('click', async function() {
-        const s = loadSel();
-        const selected = Object.values(s);
-        try {
-            await fetch('/np-done', {
-                method: 'POST', body: JSON.stringify(selected),
-                headers: {'Content-Type': 'application/json'}
-            });
-        } catch(e) {}
-        localStorage.removeItem(STORAGE_KEY);
-        document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:system-ui,sans-serif;font-size:24px;color:#666;">Selection saved. You can close this tab.</div>';
-    });
-
-    // Init now and watch for dynamically loaded content
-    initArticles();
-    updateCounters();
-
-    // Re-init periodically to catch dynamically loaded articles
-    const observer = new MutationObserver(() => { initArticles(); updateCounters(); });
-    observer.observe(document.body, { childList: true, subtree: true });
-})();
+// Initial render — group by topic
+reorder();
+update();
 </script>
-"""
+</body></html>"""
 
 
 # ---------------------------------------------------------------------------
-# Proxy HTTP server
+# Minimal HTTP server — serves the selection page and receives the result
 # ---------------------------------------------------------------------------
 
-class _ProxyHandler(BaseHTTPRequestHandler):
-    """Transparently proxies tldr.tech, injecting selector on HTML pages."""
-
+class _Handler(BaseHTTPRequestHandler):
+    page_html: str = ""
     selection_result: list[dict] = []
     done_event: threading.Event
-    _session: requests.Session
-
-    def _proxy(self):
-        """Forward request to tldr.tech and return the response."""
-        upstream = TLDR_BASE + self.path
-        logger.info("PROXY %s -> %s", self.path, upstream)
-        try:
-            resp = self.__class__._session.get(upstream, timeout=15, headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept": self.headers.get("Accept", "*/*"),
-                "Accept-Encoding": "identity",
-                "Accept-Language": self.headers.get("Accept-Language", "en-US,en;q=0.9"),
-            }, allow_redirects=True)
-            logger.info("  -> %d %s (%d bytes)", resp.status_code, resp.headers.get("Content-Type", "?"), len(resp.content))
-            return resp
-        except Exception as e:
-            logger.error("Proxy error for %s: %s", self.path, e)
-            return None
 
     def do_GET(self):
-        resp = self._proxy()
-        if resp is None:
-            self.send_response(502)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-
-        ct = resp.headers.get("Content-Type", "")
-        content = resp.content
-
-        # Inject selector into HTML pages
-        if "text/html" in ct:
-            html = content.decode("utf-8", errors="replace")
-            # Rewrite absolute links to tldr.tech to go through proxy
-            html = html.replace('href="https://tldr.tech/', 'href="/')
-            html = html.replace("href='https://tldr.tech/", "href='/")
-            if "</body>" in html:
-                html = html.replace("</body>", INJECTION + "\n</body>", 1)
-            else:
-                html += INJECTION
-            out = html.encode("utf-8")
-        else:
-            out = content
-
-        self.send_response(resp.status_code)
-        self.send_header("Content-Type", ct)
+        out = self.__class__.page_html.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(out)))
-        if "Cache-Control" in resp.headers:
-            self.send_header("Cache-Control", resp.headers["Cache-Control"])
         self.end_headers()
         self.wfile.write(out)
 
@@ -332,7 +297,6 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 self.__class__.selection_result = json.loads(body)
             except (json.JSONDecodeError, ValueError):
                 self.__class__.selection_result = []
-
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -343,70 +307,52 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def log_message(self, format: str, *args: Any) -> None:
-        logger.debug(format, *args)
-
-
-def _extract_domain(url: str) -> str:
-    """Extract domain from URL, stripping www. prefix."""
-    try:
-        host = urlparse(url).netloc
-        return host.removeprefix("www.")
-    except Exception:
-        return ""
+        pass  # silence request logs
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-def visual_select() -> list[Article]:
-    """Open browser with TLDR.tech proxy, return selected articles."""
-    handler = _ProxyHandler
+def visual_select(articles: list[Article]) -> list[Article]:
+    """Show a local selection page in the browser, return selected articles."""
+    handler = _Handler
+    handler.page_html = _build_selection_html(articles)
     handler.selection_result = []
     handler.done_event = threading.Event()
-    handler._session = requests.Session()
 
-    server = HTTPServer(("127.0.0.1", 0), handler)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     port = server.server_address[1]
     url = f"http://localhost:{port}/"
 
-    logger.info("Selection server at %s", url)
+    logger.info("Selection page at %s", url)
     print(f"\n  Newspaiper selector: {url}\n")
 
     threading.Thread(target=webbrowser.open, args=(url,), daemon=True).start()
-
-    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
-    server_thread.start()
+    threading.Thread(target=server.serve_forever, daemon=True).start()
 
     done = handler.done_event.wait(timeout=SERVER_TIMEOUT)
     server.shutdown()
-    handler._session.close()
 
     if not done:
-        logger.warning("Selection timed out — no articles selected")
+        logger.warning("Selection timed out")
         return []
 
-    # Convert JS selection data to Article objects
-    articles: list[Article] = []
+    # Map selections back to articles
+    selected: list[Article] = []
     for item in handler.selection_result:
         if not isinstance(item, dict):
             continue
-        source_url = item.get("url", "")
-        a = Article(
-            title=item.get("title", ""),
-            source_url=source_url,
-            source_domain=_extract_domain(source_url),
-            category=item.get("category", ""),
-            read_time=item.get("readTime", ""),
-            read_time_minutes=int(item.get("readTimeMin", 0)),
-            tldr_summary=item.get("summary", ""),
-            fetch_status="pending",
-        )
-        if item.get("mode") == "summary":
-            a.body = a.tldr_summary
+        idx = item.get("idx")
+        mode = item.get("mode", "full")
+        if idx is None or idx < 0 or idx >= len(articles):
+            continue
+
+        a = articles[idx]
+        if mode == "summary":
+            a.body = a.tldr_summary or a.body
             a.word_count = len(a.body.split())
             a.is_paywalled = True
+        selected.append(a)
 
-        articles.append(a)
-
-    return articles
+    return selected

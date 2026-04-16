@@ -22,14 +22,36 @@ HEADER_HEIGHT = 9 * mm      # pages 2+
 FOOTER_HEIGHT = 6 * mm
 
 # ---------------------------------------------------------------------------
-# Typography — Palatino Linotype (registered in renderer.py)
+# Typography — Palatino (registered in renderer.py)
 # ---------------------------------------------------------------------------
-PALATINO_PATHS = {
-    "regular": "C:/Windows/Fonts/pala.ttf",
-    "bold":    "C:/Windows/Fonts/palab.ttf",
-    "italic":  "C:/Windows/Fonts/palai.ttf",
-    "bold_italic": "C:/Windows/Fonts/palabi.ttf",
-}
+import platform as _platform
+import os as _os
+
+def _find_palatino_paths() -> dict[str, str] | None:
+    """Find Palatino font files, platform-aware."""
+    if _platform.system() == "Darwin":
+        ttc = "/System/Library/Fonts/Palatino.ttc"
+        if _os.path.exists(ttc):
+            # TTC subfont indices: 0=Regular, 1=Italic, 2=Bold, 3=BoldItalic
+            return {
+                "regular": ttc,
+                "bold": ttc,
+                "italic": ttc,
+                "bold_italic": ttc,
+                "_ttc_indices": {"regular": 0, "bold": 2, "italic": 1, "bold_italic": 3},
+            }
+    elif _platform.system() == "Windows":
+        base = "C:/Windows/Fonts"
+        if _os.path.exists(f"{base}/pala.ttf"):
+            return {
+                "regular": f"{base}/pala.ttf",
+                "bold": f"{base}/palab.ttf",
+                "italic": f"{base}/palai.ttf",
+                "bold_italic": f"{base}/palabi.ttf",
+            }
+    return None
+
+PALATINO_PATHS = _find_palatino_paths()
 
 FONTS = {
     "section_header": {"face": "Helvetica-Bold", "size": 8.5, "leading": 10},

@@ -50,18 +50,43 @@ from models import Article
 
 logger = logging.getLogger(__name__)
 
-# Register Palatino Linotype font family
-pdfmetrics.registerFont(TTFont("Palatino", PALATINO_PATHS["regular"]))
-pdfmetrics.registerFont(TTFont("Palatino-Bold", PALATINO_PATHS["bold"]))
-pdfmetrics.registerFont(TTFont("Palatino-Italic", PALATINO_PATHS["italic"]))
-pdfmetrics.registerFont(TTFont("Palatino-BoldItalic", PALATINO_PATHS["bold_italic"]))
-pdfmetrics.registerFontFamily(
-    "Palatino",
-    normal="Palatino",
-    bold="Palatino-Bold",
-    italic="Palatino-Italic",
-    boldItalic="Palatino-BoldItalic",
-)
+# Register Palatino font family (platform-aware, with fallback)
+if PALATINO_PATHS is not None:
+    try:
+        indices = PALATINO_PATHS.get("_ttc_indices")
+        if indices:
+            # macOS TTC — each style is a subfont index
+            pdfmetrics.registerFont(TTFont("Palatino", PALATINO_PATHS["regular"], subfontIndex=indices["regular"]))
+            pdfmetrics.registerFont(TTFont("Palatino-Bold", PALATINO_PATHS["bold"], subfontIndex=indices["bold"]))
+            pdfmetrics.registerFont(TTFont("Palatino-Italic", PALATINO_PATHS["italic"], subfontIndex=indices["italic"]))
+            pdfmetrics.registerFont(TTFont("Palatino-BoldItalic", PALATINO_PATHS["bold_italic"], subfontIndex=indices["bold_italic"]))
+        else:
+            # Windows — separate TTF files
+            pdfmetrics.registerFont(TTFont("Palatino", PALATINO_PATHS["regular"]))
+            pdfmetrics.registerFont(TTFont("Palatino-Bold", PALATINO_PATHS["bold"]))
+            pdfmetrics.registerFont(TTFont("Palatino-Italic", PALATINO_PATHS["italic"]))
+            pdfmetrics.registerFont(TTFont("Palatino-BoldItalic", PALATINO_PATHS["bold_italic"]))
+        pdfmetrics.registerFontFamily(
+            "Palatino",
+            normal="Palatino",
+            bold="Palatino-Bold",
+            italic="Palatino-Italic",
+            boldItalic="Palatino-BoldItalic",
+        )
+        logger.debug("Registered Palatino font family")
+    except Exception as e:
+        logger.warning("Failed to register Palatino fonts: %s. Falling back to Times.", e)
+        PALATINO_PATHS = None
+
+if PALATINO_PATHS is None:
+    # Fallback: remap Palatino names to built-in Times
+    from config import FONTS
+    _FALLBACK = {"Palatino": "Times-Roman", "Palatino-Bold": "Times-Bold",
+                 "Palatino-Italic": "Times-Italic", "Palatino-BoldItalic": "Times-BoldItalic"}
+    for key, spec in FONTS.items():
+        if spec["face"] in _FALLBACK:
+            spec["face"] = _FALLBACK[spec["face"]]
+    logger.info("Using Times-Roman as Palatino fallback")
 
 DARK_GRAY = Color(0.3, 0.3, 0.3)
 RULE_COLOR = Color(0.6, 0.6, 0.6)
@@ -75,19 +100,55 @@ IMG_MAX_HEIGHT = 60 * mm
 _image_cache: dict[str, Image | None] = {}
 
 
+def _compress_image(raw_bytes: bytes) -> bytes:
+    """Downscale and compress image bytes to JPEG."""
+    from PIL import Image as PILImage
+
+    pil_img = PILImage.open(io.BytesIO(raw_bytes))
+    pil_img = pil_img.convert("RGB")
+
+    max_px = 400
+    if pil_img.width > max_px:
+        ratio = max_px / pil_img.width
+        pil_img = pil_img.resize(
+            (max_px, int(pil_img.height * ratio)),
+            PILImage.LANCZOS,
+        )
+
+    buf = io.BytesIO()
+    pil_img.save(buf, format="JPEG", quality=60, optimize=True)
+    return buf.getvalue()
+
+
+def _bytes_to_flowable(jpg_bytes: bytes) -> Image:
+    """Convert JPEG bytes to a sized reportlab Image flowable."""
+    buf = io.BytesIO(jpg_bytes)
+    reader = ImageReader(buf)
+    iw, ih = reader.getSize()
+    scale = min(IMG_MAX_WIDTH / iw, IMG_MAX_HEIGHT / ih, 1.0)
+    return Image(buf, width=iw * scale, height=ih * scale)
+
+
 def _fetch_image(url: str) -> Image | None:
     """Download an image, compress it, and return a reportlab Image flowable."""
     if url in _image_cache:
         return _image_cache[url]
 
-    # Skip relative URLs and tiny icons
     if not url.startswith("http"):
         _image_cache[url] = None
         return None
 
-    try:
-        from PIL import Image as PILImage
+    from cache import get_image, put_image
 
+    try:
+        # Check disk cache first
+        cached_bytes = get_image(url)
+        if cached_bytes:
+            img = _bytes_to_flowable(cached_bytes)
+            _image_cache[url] = img
+            return img
+
+        # Download
         resp = requests.get(url, timeout=10, headers={"User-Agent": "newspaiper/1.0"})
         resp.raise_for_status()
         content_type = resp.headers.get("content-type", "")
@@ -95,32 +156,10 @@ def _fetch_image(url: str) -> Image | None:
             _image_cache[url] = None
             return None
 
-        pil_img = PILImage.open(io.BytesIO(resp.content))
-        pil_img = pil_img.convert("RGB")
+        jpg_bytes = _compress_image(resp.content)
+        put_image(url, jpg_bytes)
 
-        # Downscale to max 400px wide (plenty for a 60mm column)
-        max_px = 400
-        if pil_img.width > max_px:
-            ratio = max_px / pil_img.width
-            pil_img = pil_img.resize(
-                (max_px, int(pil_img.height * ratio)),
-                PILImage.LANCZOS,
-            )
-
-        # Save as compressed JPEG in memory
-        buf = io.BytesIO()
-        pil_img.save(buf, format="JPEG", quality=60, optimize=True)
-        buf.seek(0)
-
-        reader = ImageReader(buf)
-        iw, ih = reader.getSize()
-
-        # Scale to fit column width / max height
-        scale = min(IMG_MAX_WIDTH / iw, IMG_MAX_HEIGHT / ih, 1.0)
-        w = iw * scale
-        h = ih * scale
-
-        img = Image(buf, width=w, height=h)
+        img = _bytes_to_flowable(jpg_bytes)
         _image_cache[url] = img
         return img
     except Exception as e:
@@ -159,6 +198,9 @@ def _build_styles(font_size_offset: float = 0.0) -> dict[str, ParagraphStyle]:
             spaceBefore=2,
             spaceAfter=1,
             alignment=TA_LEFT,
+            backColor=Color(0.92, 0.92, 0.92),
+            leftIndent=2,
+            rightIndent=2,
         ),
         "headline": ParagraphStyle(
             "headline",
@@ -168,6 +210,9 @@ def _build_styles(font_size_offset: float = 0.0) -> dict[str, ParagraphStyle]:
             spaceBefore=2,
             spaceAfter=1,
             alignment=TA_LEFT,
+            backColor=Color(0.92, 0.92, 0.92),
+            leftIndent=2,
+            rightIndent=2,
         ),
         "subtitle": ParagraphStyle(
             "subtitle",
@@ -238,9 +283,9 @@ def _draw_masthead(canvas, doc, target_date: str):
 
     y_base = PAGE_HEIGHT - MARGIN_TOP
 
-    # Title
-    canvas.setFont("Helvetica-Bold", 22)
-    canvas.drawString(MARGIN_H, y_base - 16, "NEWSPAIPER")
+    # Title (1.5x size)
+    canvas.setFont("Helvetica-Bold", 33)
+    canvas.drawString(MARGIN_H, y_base - 22, "NEWSPAIPER")
 
     # Subtitle line
     canvas.setFont("Helvetica", 7)
@@ -337,14 +382,31 @@ def _escape_xml(text: str) -> str:
 def _inline_markdown(text: str) -> str:
     """Convert inline markdown (**bold**, *italic*, `code`) to reportlab XML."""
     text = _escape_xml(text)
+    # Inline code first (protect from bold/italic processing)
+    text = re.sub(r"`([^`]+)`", r'<font face="Courier" size="7">\1</font>', text)
+    # Bold+italic: ***text*** or ___text___
+    text = re.sub(r"\*\*\*(.+?)\*\*\*", r"<b><i>\1</i></b>", text)
+    text = re.sub(r"___(.+?)___", r"<b><i>\1</i></b>", text)
     # Bold: **text** or __text__
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
     text = re.sub(r"__(.+?)__", r"<b>\1</b>", text)
-    # Italic: *text* or _text_ (but not inside bold)
-    text = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"<i>\1</i>", text)
-    # Inline code: `text`
-    text = re.sub(r"`([^`]+)`", r'<font face="Courier" size="7">\1</font>', text)
+    # Italic: *text* or _text_ (single, not inside bold markers)
+    text = re.sub(r"(?<![*<])\*([^*<>]+?)\*(?![*>])", r"<i>\1</i>", text)
+    text = re.sub(r"(?<![_<])_([^_<>]+?)_(?![_>])", r"<i>\1</i>", text)
+    # Clean up any leftover stray asterisks/underscores
+    text = re.sub(r"(?<!\w)\*{1,3}(?!\w)", "", text)
+    text = re.sub(r"(?<!\w)_{1,3}(?!\w)", "", text)
     return text
+
+
+def _safe_paragraph(text: str, style) -> Paragraph:
+    """Create a Paragraph, falling back to plain text if XML parsing fails."""
+    try:
+        return Paragraph(text, style)
+    except (ValueError, Exception):
+        # Strip all XML tags and render as plain text
+        plain = re.sub(r"<[^>]+>", "", text)
+        return Paragraph(plain, style)
 
 
 def _body_to_flowables(
@@ -380,7 +442,7 @@ def _body_to_flowables(
                         code_text = "<br/>".join(
                             _escape_xml(cl) for cl in code_lines
                         )
-                        flowables.append(Paragraph(
+                        flowables.append(_safe_paragraph(
                             f'<font face="Courier" size="6.5">{code_text}</font>',
                             styles["body"],
                         ))
@@ -416,33 +478,57 @@ def _body_to_flowables(
         m = re.match(r"^(#{1,3})\s+(.+)$", joined.strip())
         if m:
             heading_text = m.group(2).strip()
-            flowables.append(Paragraph(
+            flowables.append(_safe_paragraph(
                 _inline_markdown(heading_text), styles["body_bold"],
             ))
             continue
 
-        # Bullet list: lines starting with - or * or numbered
+        # Bullet list: lines starting with - or * or • followed by space, or numbered
+        _bullet_re = re.compile(r"^[-*\u2022]\s+|^\d+\.\s+")
         all_lines = [l.strip() for l in processed_lines if l.strip()]
-        if all_lines and all(
-            re.match(r"^[-*\u2022]|\d+\.", l) for l in all_lines
-        ):
+
+        has_bullets = any(_bullet_re.match(l) for l in all_lines)
+        all_bullets = has_bullets and all(_bullet_re.match(l) for l in all_lines)
+
+        if all_bullets:
             for li in all_lines:
-                li = re.sub(r"^[-*\u2022]\s*", "", li)
-                li = re.sub(r"^\d+\.\s*", "", li)
+                li = _bullet_re.sub("", li, count=1)
                 if li:
-                    flowables.append(Paragraph(
+                    flowables.append(_safe_paragraph(
                         f"\u2022 {_inline_markdown(li)}", styles["body"],
                     ))
             continue
 
+        if has_bullets:
+            # Mixed block: render bullets individually, join non-bullet runs
+            run: list[str] = []
+            for li in all_lines:
+                if _bullet_re.match(li):
+                    if run:
+                        flowables.append(_safe_paragraph(
+                            _inline_markdown(" ".join(run)), styles["body"],
+                        ))
+                        run = []
+                    li = _bullet_re.sub("", li, count=1)
+                    flowables.append(_safe_paragraph(
+                        f"\u2022 {_inline_markdown(li)}", styles["body"],
+                    ))
+                else:
+                    run.append(li)
+            if run:
+                flowables.append(_safe_paragraph(
+                    _inline_markdown(" ".join(run)), styles["body"],
+                ))
+            continue
+
         # Regular paragraph — join lines, process inline markdown
         text = " ".join(l.strip() for l in processed_lines)
-        flowables.append(Paragraph(_inline_markdown(text), styles["body"]))
+        flowables.append(_safe_paragraph(_inline_markdown(text), styles["body"]))
 
     # Flush any unclosed code block
     if code_lines:
         code_text = "<br/>".join(_escape_xml(cl) for cl in code_lines)
-        flowables.append(Paragraph(
+        flowables.append(_safe_paragraph(
             f'<font face="Courier" size="6.5">{code_text}</font>',
             styles["body"],
         ))
