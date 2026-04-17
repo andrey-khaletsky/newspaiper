@@ -393,10 +393,12 @@ def _inline_markdown(text: str) -> str:
     # Italic: *text* or _text_ (single, not inside bold markers)
     text = re.sub(r"(?<![*<])\*([^*<>]+?)\*(?![*>])", r"<i>\1</i>", text)
     text = re.sub(r"(?<![_<])_([^_<>]+?)_(?![_>])", r"<i>\1</i>", text)
+    # Strip inline image references (rendered separately as flowables)
+    text = re.sub(r"!\[.*?\]\([^\s)]+\)", "", text)
     # Clean up any leftover stray asterisks/underscores
     text = re.sub(r"(?<!\w)\*{1,3}(?!\w)", "", text)
     text = re.sub(r"(?<!\w)_{1,3}(?!\w)", "", text)
-    return text
+    return text.strip()
 
 
 def _safe_paragraph(text: str, style) -> Paragraph:
@@ -481,6 +483,16 @@ def _body_to_flowables(
             flowables.append(_safe_paragraph(
                 _inline_markdown(heading_text), styles["body_bold"],
             ))
+            continue
+
+        # Inline image: ![alt](url) on its own line
+        img_match = re.match(r"^!\[.*?\]\((https?://[^\s)]+)\)\s*$", joined.strip())
+        if img_match:
+            img = _fetch_image(img_match.group(1))
+            if img is not None:
+                flowables.append(Spacer(1, 2))
+                flowables.append(img)
+                flowables.append(Spacer(1, 2))
             continue
 
         # Bullet list: lines starting with - or * or • followed by space, or numbered

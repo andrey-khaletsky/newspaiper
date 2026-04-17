@@ -182,6 +182,49 @@ def fetch_tldr_pages(
 # ---------------------------------------------------------------------------
 
 MIN_BODY_LEN = 50
+JINA_TIMEOUT = 20
+
+
+def _try_jina(url: str) -> tuple[str, str]:
+    """Fetch article via Jina Reader API. Returns (markdown_body, first_image_url).
+
+    Jina renders JS, bypasses most paywalls, and returns clean markdown
+    with inline images as ![alt](url).
+    """
+    try:
+        resp = requests.get(
+            f"https://r.jina.ai/{url}",
+            headers={
+                "Accept": "text/markdown",
+                "X-No-Cache": "true",
+            },
+            timeout=JINA_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            return "", ""
+
+        body = resp.text.strip()
+
+        # Strip Jina metadata headers (Title:, URL Source:, Warning:, Markdown Content:)
+        body = re.sub(r"^Title:.*$", "", body, flags=re.MULTILINE)
+        body = re.sub(r"^URL Source:.*$", "", body, flags=re.MULTILINE)
+        body = re.sub(r"^Warning:.*$", "", body, flags=re.MULTILINE)
+        body = re.sub(r"^Markdown Content:\s*$", "", body, flags=re.MULTILINE)
+        body = body.strip()
+
+        if len(body) < MIN_BODY_LEN:
+            return "", ""
+
+        # Extract first image URL from markdown ![alt](url)
+        first_image = ""
+        img_match = re.search(r"!\[.*?\]\((https?://[^\s)]+)\)", body)
+        if img_match:
+            first_image = img_match.group(1)
+
+        return body, first_image
+    except Exception as e:
+        logger.debug("Jina Reader failed for %s: %s", url, e)
+        return "", ""
 
 
 def _extract_og_image(html: str) -> str:
@@ -254,11 +297,21 @@ def _fetch_google_cache(url: str) -> str | None:
     return None
 
 
+def _set_body(article: Article, body: str, image_url: str = "") -> Article:
+    """Set article body and update word count / status."""
+    article.body = body
+    article.word_count = len(body.split())
+    article.fetch_status = "ok"
+    if image_url and not article.image_url:
+        article.image_url = image_url
+    return article
+
+
 def fetch_source_article(article: Article) -> Article:
     """Fetch full text from the article's source URL with fallback chain.
 
-    Chain: cache → trafilatura (precision) → trafilatura (recall) →
-           readability-lxml → Wayback Machine → Google Cache
+    Chain: cache → Jina Reader → trafilatura → readability-lxml →
+           Wayback Machine → Google Cache
     """
     from cache import get_article, put_article
 
@@ -273,9 +326,14 @@ def fetch_source_article(article: Article) -> Article:
         logger.info("    (cached)")
         return article
 
-    html = None
+    # Step 1: Jina Reader API (handles JS, paywalls, returns markdown + images)
+    body, jina_image = _try_jina(article.source_url)
+    if body and len(body) >= MIN_BODY_LEN:
+        logger.debug("    Jina Reader succeeded")
+        return _set_body(article, body, jina_image)
 
-    # Step 0: Download the page
+    # Step 2: Download HTML and try local extractors
+    html = None
     try:
         downloaded = trafilatura.fetch_url(article.source_url)
         if downloaded is not None:
@@ -284,7 +342,6 @@ def fetch_source_article(article: Article) -> Article:
         pass
 
     if html is None:
-        # Retry with requests
         try:
             resp = requests.get(article.source_url, headers=HEADERS,
                                 timeout=FETCH_TIMEOUT, allow_redirects=True)
@@ -293,69 +350,43 @@ def fetch_source_article(article: Article) -> Article:
         except requests.RequestException:
             pass
 
-    if html is None:
-        logger.warning("Could not download %s", article.source_url)
-        article.fetch_status = "failed"
-        return article
+    if html:
+        # Extract og:image
+        if not article.image_url:
+            article.image_url = _extract_og_image(html)
 
-    # Extract og:image before we do anything else
-    article.image_url = _extract_og_image(html)
+        # Step 3: trafilatura — precision
+        body = _try_trafilatura(html, favor_precision=True)
+        if body and len(body) >= MIN_BODY_LEN:
+            return _set_body(article, body)
 
-    # Step 1: trafilatura — precision mode
-    body = _try_trafilatura(html, favor_precision=True)
-    if body and len(body) >= MIN_BODY_LEN:
-        article.body = body
-        article.word_count = len(body.split())
-        article.fetch_status = "ok"
-        return article
+        # Step 4: trafilatura — recall
+        body = _try_trafilatura(html, favor_precision=False)
+        if body and len(body) >= MIN_BODY_LEN:
+            return _set_body(article, body)
 
-    # Step 2: trafilatura — recall mode (less precise, grabs more)
-    logger.debug("  Precision extraction too short, trying recall mode")
-    body = _try_trafilatura(html, favor_precision=False)
-    if body and len(body) >= MIN_BODY_LEN:
-        article.body = body
-        article.word_count = len(body.split())
-        article.fetch_status = "ok"
-        return article
+        # Step 5: readability-lxml
+        body = _try_readability(html)
+        if body and len(body) >= MIN_BODY_LEN:
+            return _set_body(article, body)
 
-    # Step 3: readability-lxml
-    logger.debug("  Trafilatura failed, trying readability-lxml")
-    body = _try_readability(html)
-    if body and len(body) >= MIN_BODY_LEN:
-        article.body = body
-        article.word_count = len(body.split())
-        article.fetch_status = "ok"
-        return article
-
-    # Step 4: Wayback Machine
-    logger.debug("  Readability failed, trying Wayback Machine")
+    # Step 6: Wayback Machine
     wb_html = _fetch_wayback(article.source_url)
     if wb_html:
-        body = _try_trafilatura(wb_html)
-        if not body or len(body) < MIN_BODY_LEN:
-            body = _try_readability(wb_html)
+        body = _try_trafilatura(wb_html) or _try_readability(wb_html)
         if body and len(body) >= MIN_BODY_LEN:
-            article.body = body
-            article.word_count = len(body.split())
-            article.fetch_status = "ok"
             if not article.image_url:
                 article.image_url = _extract_og_image(wb_html)
-            return article
+            return _set_body(article, body)
 
-    # Step 5: Google Cache
-    logger.debug("  Wayback failed, trying Google Cache")
+    # Step 7: Google Cache
     gc_html = _fetch_google_cache(article.source_url)
     if gc_html:
-        body = _try_trafilatura(gc_html)
-        if not body or len(body) < MIN_BODY_LEN:
-            body = _try_readability(gc_html)
+        body = _try_trafilatura(gc_html) or _try_readability(gc_html)
         if body and len(body) >= MIN_BODY_LEN:
-            article.body = body
-            article.word_count = len(body.split())
-            article.fetch_status = "ok"
             if not article.image_url:
                 article.image_url = _extract_og_image(gc_html)
-            return article
+            return _set_body(article, body)
 
     logger.warning("All extraction methods failed for %s", article.source_url)
     article.fetch_status = "failed"
